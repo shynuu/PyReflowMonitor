@@ -1,6 +1,7 @@
 # Reflow Monitor — Real-Time SAC305 Solder Profile Tracker
 
-**Based on the work done in https://github.com/leswright1977/PyThermalCamera with modifications for MACOS support and features required for the reflow monitor. Requires a Topdon TC001/TS001 Thermal Camera or similar**
+**Based on the work done in https://github.com/leswright1977/PyThermalCamera with modifications for MACOS support and features required for the reflow monitor. Requires a Topdon TC001/TS001 Thermal Camera or similar
+Mix of own code + claude opus 4.6 model code**
 
 A real-time reflow soldering monitor that uses a Topdon TC001 / TS001 thermal
 camera to track board temperatures against the
