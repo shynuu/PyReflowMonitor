@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 '''
-Les Wright 21 June 2023
+Derived from work of Les Wright - 21 June 2023
 https://youtube.com/leslaboratory
-A Python program to read, parse and display thermal data from the Topdon TC001 Thermal camera!
+A Python program to read, parse and display thermal data from the Topdon TC001/TS001 Thermal camera!
+
+Adaption by Youssouf Drif - 11 February 2026 for use on MACOS and tracking reflow temperature of PCB when using Hot plates.
 
 macOS adaptation: Uses ffmpeg pipe instead of cv2.VideoCapture for reliable
 avfoundation capture with raw YUYV data (preserves thermal data).
+
+Claude Opus 4.6 used to improve the code
 '''
 import os
 import time
