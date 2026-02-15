@@ -11,6 +11,7 @@ avfoundation capture with raw YUYV data (preserves thermal data).
 
 Claude Opus 4.6 used to improve the code
 '''
+import usb.core
 import os
 import time
 import argparse
@@ -28,6 +29,54 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+
+class TS001USB(object):
+    def __init__(self, idVendor=0x0BDA, idProduct=0x5830):
+        self.idVendor = idVendor
+        self.idProduct = idProduct
+        self.dev = usb.core.find(
+            idVendor=self.idVendor, idProduct=self.idProduct)
+        if self.dev is None:
+            raise ValueError(
+                "Device not found. Make sure the camera is connected.")
+        self.dev.set_configuration()
+
+    def switch_to_low_temperature(self):
+        bRequestType = 0x41
+        bRequest = 69
+        wValue = 0x0078
+        wIndex = 0x9d00
+        data = b"\x14\xc5\x00\x05\x00\x00\x00\x01"
+        response = self.dev.ctrl_transfer(bmRequestType=bRequestType, bRequest=bRequest,
+                                          wValue=wValue, wIndex=wIndex, data_or_wLength=data)
+
+        wIndex = 0x1d08
+        data = b"\x00\x00\x00\x00\x00\x00\x00\x00"
+        response = self.dev.ctrl_transfer(bmRequestType=bRequestType, bRequest=bRequest,
+                                          wValue=wValue, wIndex=wIndex, data_or_wLength=data)
+        return response
+
+    def switch_to_high_temperature(self):
+        bRequestType = 0x41
+        bRequest = 69
+        wValue = 0x0078
+        wIndex = 0x9d00
+        data = b"\x14\xc5\x00\x05\x00\x00\x00\x00"
+        response = self.dev.ctrl_transfer(bmRequestType=bRequestType, bRequest=bRequest,
+                                          wValue=wValue, wIndex=wIndex, data_or_wLength=data)
+
+        wIndex = 0x1d08
+        data = b"\x00\x00\x00\x00\x00\x00\x00\x00"
+        response = self.dev.ctrl_transfer(bmRequestType=bRequestType, bRequest=bRequest,
+                                          wValue=wValue, wIndex=wIndex, data_or_wLength=data)
+        return response
+
+    @classmethod
+    def list_devices(self):
+        devs = usb.core.find(find_all=True)
+        for dev in devs:
+            print(dev)
 
 
 class CameraParameters(object):
@@ -313,9 +362,10 @@ def plot_sac305_profile():
             fontsize=9, fontweight='bold', color='darkblue')
 
     # --- Key point markers (from Chip Quik SMD291SNL datasheet) ---
-    key_times =  [0,    90,    180,    210,    240,          270,    370]
-    key_temps =  [25,  150,    175,    217,    249,          217,     25]
-    key_labels = ['25°C', '150°C', '175°C', '217°C', '249°C\n(peak)', '217°C', '25°C']
+    key_times = [0,    90,    180,    210,    240,          270,    370]
+    key_temps = [25,  150,    175,    217,    249,          217,     25]
+    key_labels = ['25°C', '150°C', '175°C',
+                  '217°C', '249°C\n(peak)', '217°C', '25°C']
     for tt, tp, lbl in zip(key_times, key_temps, key_labels):
         ax.plot(tt, tp, 'ko', markersize=5, zorder=6)
         ax.annotate(lbl, (tt, tp), textcoords="offset points",
@@ -361,7 +411,10 @@ class ReflowMonitor(object):
 
     def __init__(self, cameraFeed: CameraFeed, scale: int = 3,
                  start_threshold: float = 35.0,
-                 start_hold_seconds: float = 5.0):
+                 start_hold_seconds: float = 5.0,
+                 ts001_usb: Optional['TS001USB'] = None,
+                 high_temp_threshold: float = 150.0,
+                 high_temp_hold_seconds: float = 5.0):
         self.cameraFeed: CameraFeed = cameraFeed
         self.thermalData: ThermalData = ThermalData(cameraFeed)
         self.scale: int = scale
@@ -373,6 +426,13 @@ class ReflowMonitor(object):
         self.start_time: Optional[float] = None
         # Tracks when the temperature first crossed the threshold (for debounce)
         self._threshold_since: Optional[float] = None
+
+        # Temperature mode switching (TS001 USB)
+        self._ts001_usb: Optional['TS001USB'] = ts001_usb
+        self._high_temp_threshold: float = high_temp_threshold
+        self._high_temp_hold_seconds: float = high_temp_hold_seconds
+        self._high_temp_mode: bool = False  # current mode: False = low, True = high
+        self._high_temp_since: Optional[float] = None  # debounce for switching to high
 
         # Temperature history lists
         self.times: List[float] = []
@@ -391,8 +451,10 @@ class ReflowMonitor(object):
 
         # Audio feedback state
         self._sound_dir: str = os.path.join(self._script_dir, "sound")
-        self._sound_too_slow: str = os.path.join(self._sound_dir, "too_slow.wav")
-        self._sound_too_fast: str = os.path.join(self._sound_dir, "too_fast.wav")
+        self._sound_too_slow: str = os.path.join(
+            self._sound_dir, "too_slow.wav")
+        self._sound_too_fast: str = os.path.join(
+            self._sound_dir, "too_fast.wav")
         self._sound_good: str = os.path.join(self._sound_dir, "good.wav")
         self._last_sound_time: float = 0.0
         self._sound_cooldown: float = 5.0  # seconds between sounds
@@ -419,8 +481,10 @@ class ReflowMonitor(object):
         # None means use the full frame
         self.roi: Optional[Tuple[int, int, int, int]] = None
         self._roi_drawing: bool = False
-        self._roi_start: Tuple[int, int] = (0, 0)  # mouse-down in window coords
-        self._roi_end: Tuple[int, int] = (0, 0)     # current mouse pos in window coords
+        self._roi_start: Tuple[int, int] = (
+            0, 0)  # mouse-down in window coords
+        # current mouse pos in window coords
+        self._roi_end: Tuple[int, int] = (0, 0)
 
         # Matplotlib update throttling: only redraw the plot at this interval
         self._plot_update_interval: float = 1.0  # seconds
@@ -436,6 +500,10 @@ class ReflowMonitor(object):
         self._bg = None  # cached background for blitting
         self.windowWidth: int = 0
         self.windowHeight: int = 0
+
+        # Key event buffer: captures key presses from matplotlib's window
+        # so they aren't lost when the plot has focus instead of the cv2 window.
+        self._pending_keys: List[str] = []
 
     def setup_plot(self) -> None:
         """Create the matplotlib figure with SAC305 reference and empty live lines."""
@@ -461,9 +529,12 @@ class ReflowMonitor(object):
 
         # --- Liquidus and peak lines ---
         ax.axhline(y=217, color='red', linestyle='--', linewidth=1, alpha=0.6)
-        ax.text(375, 220, '217°C liquidus', fontsize=7, color='red', va='bottom')
-        ax.axhline(y=249, color='darkred', linestyle=':', linewidth=1, alpha=0.4)
-        ax.text(375, 251, '249°C peak', fontsize=7, color='darkred', va='bottom')
+        ax.text(375, 220, '217°C liquidus',
+                fontsize=7, color='red', va='bottom')
+        ax.axhline(y=249, color='darkred',
+                   linestyle=':', linewidth=1, alpha=0.4)
+        ax.text(375, 251, '249°C peak', fontsize=7,
+                color='darkred', va='bottom')
 
         # --- Zone labels ---
         ax.text(45, 10, 'PREHEAT', ha='center', fontsize=8,
@@ -506,14 +577,23 @@ class ReflowMonitor(object):
 
         # --- Legend ---
         handles = [
-            mpatches.Patch(color='orange', alpha=0.25, label='Preheat (0-90s)'),
+            mpatches.Patch(color='orange', alpha=0.25,
+                           label='Preheat (0-90s)'),
             mpatches.Patch(color='gold', alpha=0.25, label='Soak (90-180s)'),
             mpatches.Patch(color='red', alpha=0.25, label='Reflow (180-270s)'),
-            mpatches.Patch(color='blue', alpha=0.25, label='Cooling (270-370s)'),
+            mpatches.Patch(color='blue', alpha=0.25,
+                           label='Cooling (270-370s)'),
         ]
         ax.legend(handles=handles + [self.line_avg, self.line_max,
                   self.line_center, ax.lines[0]],
                   loc='upper left', fontsize=8)
+
+        # Capture key presses on the matplotlib window so they aren't lost
+        # when the plot has focus instead of the OpenCV window.
+        self.fig.canvas.mpl_connect(
+            'key_press_event',
+            lambda event: self._pending_keys.append(event.key)
+        )
 
         self.fig.tight_layout()
         self.fig.canvas.draw()
@@ -633,8 +713,8 @@ class ReflowMonitor(object):
         cv2.setMouseCallback(window_name, _mouse_cb)
 
         logger.info("ROI selection mode. Click first corner, move to second "
-                     "corner, click again. Then press ENTER to confirm. "
-                     "Press ESC to skip (full frame).")
+                    "corner, click again. Then press ENTER to confirm. "
+                    "Press ESC to skip (full frame).")
 
         while True:
             # Read a frame and build heatmap
@@ -749,7 +829,8 @@ class ReflowMonitor(object):
                           (0, 255, 0), 2)
 
         # HUD overlay
-        cv2.rectangle(heatmap, (0, 0), (220, 110), (0, 0, 0), -1)
+        hud_height = 126 if self._ts001_usb is not None else 110
+        cv2.rectangle(heatmap, (0, 0), (220, hud_height), (0, 0, 0), -1)
 
         if self.started:
             elapsed = time.time() - self.start_time
@@ -804,6 +885,15 @@ class ReflowMonitor(object):
             label = pace_labels.get(pace, "")
             cv2.putText(heatmap, label, (10, y_offset + 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2,
+                        cv2.LINE_AA)
+
+        # Temperature mode indicator (TS001)
+        if self._ts001_usb is not None:
+            mode_label = "HIGH" if self._high_temp_mode else "LOW"
+            mode_color = (0, 0, 255) if self._high_temp_mode else (255, 200, 0)
+            cv2.putText(heatmap, f'Range: {mode_label}',
+                        (10, y_offset + 68),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, mode_color, 1,
                         cv2.LINE_AA)
 
         # Apply rotation (0=none, 1=90° CW, 2=180°, 3=90° CCW)
@@ -1018,6 +1108,65 @@ class ReflowMonitor(object):
             if sound:
                 self._play_sound(sound, priority=True)
 
+    def _check_temp_mode(self, max_temp: float) -> None:
+        """Auto-switch between low/high temperature mode on the TS001.
+
+        The TS001 camera defaults to low-temperature mode which caps readings
+        at ~215.7°C.  When max_temp exceeds self._high_temp_threshold (150°C)
+        for self._high_temp_hold_seconds (5s), the camera is switched to
+        high-temperature mode (up to 550°C).  When max_temp drops back below
+        the threshold, it immediately switches back to low mode for better
+        accuracy at lower temperatures.
+        """
+        if self._ts001_usb is None:
+            return
+
+        now = time.time()
+
+        if not self._high_temp_mode:
+            # Currently in LOW mode — check if we need to go HIGH
+            if max_temp >= self._high_temp_threshold:
+                if self._high_temp_since is None:
+                    self._high_temp_since = now
+                    logger.info(
+                        f"Max temp {max_temp:.1f}°C >= "
+                        f"{self._high_temp_threshold}°C, "
+                        f"holding for {self._high_temp_hold_seconds}s "
+                        f"before switching to high-temp mode...")
+                held = now - self._high_temp_since
+                if held >= self._high_temp_hold_seconds:
+                    logger.info(
+                        f"Switching to HIGH temperature mode "
+                        f"(max temp held >= {self._high_temp_threshold}°C "
+                        f"for {self._high_temp_hold_seconds}s)")
+                    try:
+                        self._ts001_usb.switch_to_high_temperature()
+                        self._high_temp_mode = True
+                        self._high_temp_since = None
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to switch to high-temp mode: {e}")
+            else:
+                # Dropped below threshold, reset debounce
+                if self._high_temp_since is not None:
+                    logger.info(
+                        f"Max temp dropped to {max_temp:.1f}°C, "
+                        f"resetting high-temp hold timer.")
+                self._high_temp_since = None
+        else:
+            # Currently in HIGH mode — switch back to LOW when below threshold
+            if max_temp < self._high_temp_threshold:
+                logger.info(
+                    f"Max temp {max_temp:.1f}°C < "
+                    f"{self._high_temp_threshold}°C, "
+                    f"switching back to LOW temperature mode.")
+                try:
+                    self._ts001_usb.switch_to_low_temperature()
+                    self._high_temp_mode = False
+                except Exception as e:
+                    logger.error(
+                        f"Failed to switch to low-temp mode: {e}")
+
     def run(self) -> None:
         """Main monitoring loop."""
         import matplotlib.pyplot as plt
@@ -1031,13 +1180,13 @@ class ReflowMonitor(object):
         self._select_roi()
 
         logger.info("Reflow monitor started. Press Esc in the thermal window "
-                     "to quit.")
+                    "to quit.")
         if self.roi is not None:
             logger.info(f"Using ROI: {self.roi}")
         else:
             logger.info("Using full frame (no ROI).")
         logger.info(f"Auto-start threshold: {self.start_threshold}°C "
-                     f"(hold for {self.start_hold_seconds}s)")
+                    f"(hold for {self.start_hold_seconds}s)")
 
         try:
             while True:
@@ -1076,18 +1225,33 @@ class ReflowMonitor(object):
                 # Check for phase transitions and play announcement sounds
                 self._check_phase_transition()
 
-                # Update both windows
+                # Auto-switch temperature mode (TS001 low/high)
+                self._check_temp_mode(max_temp)
+
+                # Update heatmap and grab key events BEFORE matplotlib
+                # flush_events() can consume them from the shared macOS
+                # event queue.
                 self._render_heatmap(avg_temp, max_temp, center_temp, pace)
+                key = cv2.waitKey(1) & 0xFF
+
+                # Update matplotlib plot (may consume events via flush_events)
                 self._update_plot(avg_temp, max_temp, center_temp, pace)
 
-                # Handle key events (Esc to quit, 's' to save)
-                key = cv2.waitKey(1) & 0xFF
-                if key == 27:  # Esc
+                # Collect keys pressed on the matplotlib window as well
+                mpl_keys = list(self._pending_keys)
+                self._pending_keys.clear()
+
+                # Handle key events from either window
+                quit_pressed = (key == 27 or 'escape' in mpl_keys)
+                save_pressed = (key == ord('s') or 's' in mpl_keys)
+                rotate_pressed = (key == ord('r') or 'r' in mpl_keys)
+
+                if quit_pressed:
                     logger.info("Esc pressed, stopping.")
                     break
-                elif key == ord('s'):
+                if save_pressed:
                     self._save_plot()
-                elif key == ord('r'):
+                if rotate_pressed:
                     self.rotation = (self.rotation + 1) % 4
                     logger.info(f"Rotation set to {self.rotation * 90}°")
 
@@ -1103,6 +1267,15 @@ class ReflowMonitor(object):
         # Save the final plot if we have any data
         if self.fig is not None and len(self.times) > 0:
             self._save_plot()
+
+        # Switch back to low temperature mode if we were in high mode
+        if self._ts001_usb is not None and self._high_temp_mode:
+            try:
+                self._ts001_usb.switch_to_low_temperature()
+                self._high_temp_mode = False
+                logger.info("Switched back to LOW temperature mode on cleanup.")
+            except Exception as e:
+                logger.error(f"Failed to switch to low-temp mode on cleanup: {e}")
 
         # Kill any sound still playing
         if self._sound_process is not None and self._sound_process.poll() is None:
@@ -1163,11 +1336,24 @@ if __name__ == "__main__":
         camera_feed = CameraFeed(camera_parameter)
         camera_feed.open(dev)
 
+        # Connect to TS001 via USB for temperature mode switching
+        ts001_usb = None
+        if args.camera == "ts001":
+            try:
+                ts001_usb = TS001USB()
+                logger.info("TS001 USB connected — auto temperature mode "
+                            "switching enabled (low <-> high at 150°C)")
+            except Exception as e:
+                logger.warning(f"Could not connect to TS001 via USB: {e}. "
+                               f"Temperature mode switching disabled. "
+                               f"Readings will be limited to ~215°C.")
+
         monitor = ReflowMonitor(
             cameraFeed=camera_feed,
             scale=3,
             start_threshold=args.start_threshold,
-            start_hold_seconds=args.start_hold
+            start_hold_seconds=args.start_hold,
+            ts001_usb=ts001_usb,
         )
         monitor.run()
         sys.exit(0)
