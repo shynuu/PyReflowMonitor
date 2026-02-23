@@ -9,7 +9,7 @@ Adaption by Youssouf Drif - 11 February 2026 for use on MACOS and tracking reflo
 macOS adaptation: Uses ffmpeg pipe instead of cv2.VideoCapture for reliable
 avfoundation capture with raw YUYV data (preserves thermal data).
 
-Claude Opus 4.6 used to improve the code
+Claude Opus 4.6 + Codex 5.3 used to improve the code
 '''
 import usb.core
 import os
@@ -21,7 +21,7 @@ import cv2
 import logging
 import sys
 import threading
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,6 +29,15 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+PCB_SAFE_PEAK_TEMPS_C: Dict[str, float] = {
+    # Minimum "Safe Peak Temp (Short Exposure)" values from pcb_temperature.md
+    "tg135_generic_fr4": 245.0,
+    "kb6164_tg135": 245.0,
+    "nan_ya_tg140f_np140": 250.0,
+    "s1141_tg140": 250.0,
+    "s1000h_tg155": 260.0,
+}
 
 
 class TS001USB(object):
@@ -146,7 +155,9 @@ class ThermalData(object):
         return (rawtemp/64)-273.15
 
     def extract_temperatures_fast(
-        self, roi: Optional[Tuple[int, int, int, int]] = None
+        self,
+        roi: Optional[Tuple[int, int, int, int]] = None,
+        exclude_zones: Optional[List[dict]] = None
     ) -> Tuple[float, float, float]:
         """Vectorized temperature extraction: returns (avg, max, center) in one shot.
 
@@ -164,15 +175,49 @@ class ThermalData(object):
         lo = thdata[..., 1].astype(np.float64) * 256
         temp_grid = (hi + lo) / 64.0 - 273.15
 
+        include_mask = np.ones(temp_grid.shape, dtype=bool)
+        if exclude_zones:
+            h, w = temp_grid.shape
+            for zone in exclude_zones:
+                shape = zone.get("shape")
+                if shape in ("rectangle", "square"):
+                    x1, y1, x2, y2 = zone["x1"], zone["y1"], zone["x2"], zone["y2"]
+                    x1 = max(0, min(x1, w - 1))
+                    y1 = max(0, min(y1, h - 1))
+                    x2 = max(0, min(x2, w))
+                    y2 = max(0, min(y2, h))
+                    include_mask[y1:y2, x1:x2] = False
+                elif shape == "circle":
+                    cx, cy, r = zone["cx"], zone["cy"], zone["r"]
+                    if r <= 0:
+                        continue
+                    x1 = max(0, cx - r)
+                    x2 = min(w, cx + r + 1)
+                    y1 = max(0, cy - r)
+                    y2 = min(h, cy + r + 1)
+                    yy, xx = np.ogrid[y1:y2, x1:x2]
+                    circle = (xx - cx) ** 2 + (yy - cy) ** 2 <= r ** 2
+                    sub = include_mask[y1:y2, x1:x2]
+                    sub[circle] = False
+                    include_mask[y1:y2, x1:x2] = sub
+
         if roi is not None:
             x1, y1, x2, y2 = roi
             region = temp_grid[y1:y2, x1:x2]
+            region_mask = include_mask[y1:y2, x1:x2]
         else:
             region = temp_grid
+            region_mask = include_mask
 
-        self.average_temperature = float(region.mean())
-        self.max_temperature = float(region.max())
-        self.min_temperature = float(region.min())
+        valid_region = region[region_mask]
+        if valid_region.size == 0:
+            # All pixels are excluded: fallback to region metrics so monitoring
+            # does not crash. This should be rare and indicates over-selection.
+            valid_region = region.reshape(-1)
+
+        self.average_temperature = float(valid_region.mean())
+        self.max_temperature = float(valid_region.max())
+        self.min_temperature = float(valid_region.min())
         cy, cx = region.shape[0] // 2, region.shape[1] // 2
         center_temp = float(region[cy, cx])
         return self.average_temperature, self.max_temperature, center_temp
@@ -414,7 +459,9 @@ class ReflowMonitor(object):
                  start_hold_seconds: float = 5.0,
                  ts001_usb: Optional['TS001USB'] = None,
                  high_temp_threshold: float = 150.0,
-                 high_temp_hold_seconds: float = 5.0):
+                 high_temp_hold_seconds: float = 5.0,
+                 pcb_material: Optional[str] = None,
+                 monitor_temp: str = "average"):
         self.cameraFeed: CameraFeed = cameraFeed
         self.thermalData: ThermalData = ThermalData(cameraFeed)
         self.scale: int = scale
@@ -433,6 +480,11 @@ class ReflowMonitor(object):
         self._high_temp_hold_seconds: float = high_temp_hold_seconds
         self._high_temp_mode: bool = False  # current mode: False = low, True = high
         self._high_temp_since: Optional[float] = None  # debounce for switching to high
+        self._pcb_material: Optional[str] = pcb_material
+        self._pcb_safe_peak_temp: Optional[float] = (
+            PCB_SAFE_PEAK_TEMPS_C.get(pcb_material) if pcb_material else None
+        )
+        self._monitor_temp: str = monitor_temp
 
         # Temperature history lists
         self.times: List[float] = []
@@ -471,7 +523,17 @@ class ReflowMonitor(object):
         self._sound_soak: str = os.path.join(self._sound_dir, "soak.wav")
         self._sound_reflow: str = os.path.join(self._sound_dir, "reflow.wav")
         self._sound_cooling: str = os.path.join(self._sound_dir, "cooling.wav")
+        self._sound_liquidus: str = os.path.join(self._sound_dir, "liquidus.wav")
+        self._sound_paste_peak: str = os.path.join(
+            self._sound_dir, "paste_max_temp_reached.wav"
+        )
+        self._sound_pcb_peak: str = os.path.join(
+            self._sound_dir, "pcb_max_temp_reached_60s.wav"
+        )
         self._current_phase: Optional[str] = None  # tracks current phase name
+        self._liquidus_announced: bool = False
+        self._paste_peak_announced: bool = False
+        self._pcb_peak_announced: bool = False
 
         # Rotation state: 0, 1, 2, or 3 (number of 90° clockwise rotations)
         self.rotation: int = 0
@@ -485,6 +547,7 @@ class ReflowMonitor(object):
             0, 0)  # mouse-down in window coords
         # current mouse pos in window coords
         self._roi_end: Tuple[int, int] = (0, 0)
+        self.exclude_zones: List[dict] = []
 
         # Matplotlib update throttling: only redraw the plot at this interval
         self._plot_update_interval: float = 1.0  # seconds
@@ -802,6 +865,170 @@ class ReflowMonitor(object):
         # Remove the mouse callback for the monitoring phase
         cv2.setMouseCallback(window_name, lambda *args: None)
 
+    def _draw_exclusion_zones(self, image: np.ndarray, display_space: bool = False) -> None:
+        """Draw configured exclusion zones on an image."""
+        for zone in self.exclude_zones:
+            shape = zone.get("shape")
+            color = (0, 0, 255)
+            if shape in ("rectangle", "square"):
+                x1, y1, x2, y2 = zone["x1"], zone["y1"], zone["x2"], zone["y2"]
+                if display_space:
+                    wx1, wy1 = self._sensor_to_window(x1, y1)
+                    wx2, wy2 = self._sensor_to_window(x2, y2)
+                else:
+                    wx1, wy1 = x1 * self.scale, y1 * self.scale
+                    wx2, wy2 = x2 * self.scale, y2 * self.scale
+                cv2.rectangle(image, (wx1, wy1), (wx2, wy2), color, 2)
+            elif shape == "circle":
+                cx, cy, r = zone["cx"], zone["cy"], zone["r"]
+                if display_space:
+                    wcx, wcy = self._sensor_to_window(cx, cy)
+                    wr = max(1, int(r * self.scale))
+                else:
+                    wcx, wcy = cx * self.scale, cy * self.scale
+                    wr = max(1, int(r * self.scale))
+                cv2.circle(image, (wcx, wcy), wr, color, 2)
+
+    def _select_exclusion_zones(self) -> None:
+        """Interactive exclusion-zone setup (rectangle/square/circle).
+
+        Controls:
+          - 1: rectangle mode
+          - 2: square mode
+          - 3: circle mode
+          - click, move, click: create one zone
+          - U: undo last zone
+          - C: clear all zones
+          - R: rotate view
+          - ENTER: start monitoring with current zones
+          - ESC: no exclusions
+        """
+        window_name = 'Thermal - Reflow Monitor'
+        shape_mode = "rectangle"
+        click_stage = 0
+        p1 = (0, 0)
+        p2 = (0, 0)
+
+        def _mouse_cb(event, x, y, flags, param):
+            nonlocal click_stage, p1, p2
+            if event == cv2.EVENT_LBUTTONDOWN:
+                if click_stage == 0:
+                    p1 = (x, y)
+                    p2 = (x, y)
+                    click_stage = 1
+                else:
+                    p2 = (x, y)
+                    sx1, sy1 = self._window_to_sensor(*p1)
+                    sx2, sy2 = self._window_to_sensor(*p2)
+                    if shape_mode == "rectangle":
+                        x1, y1 = min(sx1, sx2), min(sy1, sy2)
+                        x2, y2 = max(sx1, sx2), max(sy1, sy2)
+                        if x2 - x1 >= 2 and y2 - y1 >= 2:
+                            self.exclude_zones.append(
+                                {"shape": "rectangle", "x1": x1, "y1": y1, "x2": x2, "y2": y2}
+                            )
+                    elif shape_mode == "square":
+                        x1, y1 = min(sx1, sx2), min(sy1, sy2)
+                        side = max(abs(sx2 - sx1), abs(sy2 - sy1))
+                        x2 = min(255, x1 + side)
+                        y2 = min(191, y1 + side)
+                        if x2 - x1 >= 2 and y2 - y1 >= 2:
+                            self.exclude_zones.append(
+                                {"shape": "square", "x1": x1, "y1": y1, "x2": x2, "y2": y2}
+                            )
+                    elif shape_mode == "circle":
+                        r = int(round(np.hypot(sx2 - sx1, sy2 - sy1)))
+                        if r >= 1:
+                            self.exclude_zones.append(
+                                {"shape": "circle", "cx": sx1, "cy": sy1, "r": r}
+                            )
+                    click_stage = 0
+            elif event == cv2.EVENT_MOUSEMOVE and click_stage == 1:
+                p2 = (x, y)
+
+        cv2.setMouseCallback(window_name, _mouse_cb)
+        logger.info("Exclusion zone selection mode enabled.")
+
+        while True:
+            self.thermalData.extract_temperatures_fast()
+            imdata = self.thermalData.imdata
+            if imdata is None:
+                continue
+
+            bgr = cv2.cvtColor(imdata, cv2.COLOR_YUV2BGR_YUYV)
+            bgr = cv2.convertScaleAbs(bgr, alpha=self.alpha)
+            bgr = cv2.resize(bgr, (self.windowWidth, self.windowHeight),
+                             interpolation=cv2.INTER_CUBIC)
+            heatmap = cv2.applyColorMap(bgr, cv2.COLORMAP_JET)
+
+            if self.rotation == 1:
+                heatmap = cv2.rotate(heatmap, cv2.ROTATE_90_CLOCKWISE)
+            elif self.rotation == 2:
+                heatmap = cv2.rotate(heatmap, cv2.ROTATE_180)
+            elif self.rotation == 3:
+                heatmap = cv2.rotate(heatmap, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+            # Draw already confirmed zones in display space.
+            self._draw_exclusion_zones(heatmap, display_space=True)
+
+            # Draw live preview for currently edited zone.
+            if click_stage == 1:
+                if shape_mode == "circle":
+                    r = int(np.hypot(p2[0] - p1[0], p2[1] - p1[1]))
+                    cv2.circle(heatmap, p1, r, (255, 255, 0), 2)
+                elif shape_mode == "square":
+                    dx = p2[0] - p1[0]
+                    dy = p2[1] - p1[1]
+                    side = max(abs(dx), abs(dy))
+                    sx = 1 if dx >= 0 else -1
+                    sy = 1 if dy >= 0 else -1
+                    p3 = (p1[0] + sx * side, p1[1] + sy * side)
+                    cv2.rectangle(heatmap, p1, p3, (255, 255, 0), 2)
+                else:
+                    cv2.rectangle(heatmap, p1, p2, (255, 255, 0), 2)
+
+            cv2.rectangle(heatmap, (0, 0), (520, 68), (0, 0, 0), -1)
+            cv2.putText(heatmap, f'Exclude mode: {shape_mode.upper()} (zones: {len(self.exclude_zones)})',
+                        (10, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        (0, 220, 255), 1, cv2.LINE_AA)
+            cv2.putText(heatmap, '1=RECT 2=SQUARE 3=CIRCLE  U=undo C=clear R=rotate',
+                        (10, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                        (220, 220, 220), 1, cv2.LINE_AA)
+            cv2.putText(heatmap, 'ENTER=start with zones  ESC=skip exclusions',
+                        (10, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                        (220, 220, 220), 1, cv2.LINE_AA)
+
+            cv2.imshow(window_name, heatmap)
+            key = cv2.waitKey(1) & 0xFF
+            if key == 13:  # ENTER
+                logger.info(f"Exclusion zones confirmed: {len(self.exclude_zones)}")
+                break
+            if key == 27:  # ESC
+                self.exclude_zones = []
+                logger.info("Exclusion zone selection skipped.")
+                break
+            if key == ord('1'):
+                shape_mode = "rectangle"
+                click_stage = 0
+            elif key == ord('2'):
+                shape_mode = "square"
+                click_stage = 0
+            elif key == ord('3'):
+                shape_mode = "circle"
+                click_stage = 0
+            elif key == ord('u') and self.exclude_zones:
+                self.exclude_zones.pop()
+                click_stage = 0
+            elif key == ord('c'):
+                self.exclude_zones = []
+                click_stage = 0
+            elif key == ord('r'):
+                self.rotation = (self.rotation + 1) % 4
+                click_stage = 0
+                logger.info(f"Rotation set to {self.rotation * 90}°")
+
+        cv2.setMouseCallback(window_name, lambda *args: None)
+
     def _render_heatmap(self, avg_temp: float, max_temp: float,
                         center_temp: float,
                         pace: Optional[str] = None) -> None:
@@ -827,6 +1054,8 @@ class ReflowMonitor(object):
             wx2, wy2 = rx2 * self.scale, ry2 * self.scale
             cv2.rectangle(heatmap, (wx1, wy1), (wx2, wy2),
                           (0, 255, 0), 2)
+        # Draw exclusion zones (red overlays)
+        self._draw_exclusion_zones(heatmap, display_space=False)
 
         # HUD overlay
         hud_height = 126 if self._ts001_usb is not None else 110
@@ -908,7 +1137,9 @@ class ReflowMonitor(object):
 
     def _update_plot(self, avg_temp: float, max_temp: float,
                      center_temp: float,
-                     pace: Optional[str] = None) -> None:
+                     pace: Optional[str] = None,
+                     monitored_temp: Optional[float] = None,
+                     monitored_label: str = "Avg") -> None:
         """Update live matplotlib lines and status text.
 
         Throttled to self._plot_update_interval (default 1s) and uses
@@ -966,9 +1197,10 @@ class ReflowMonitor(object):
             elapsed_str = time.strftime("%M:%S", time.gmtime(elapsed))
             pace_label = {"slow": "TOO SLOW", "fast": "TOO FAST",
                           "good": "GOOD"}.get(pace, "")
+            shown_monitored = avg_temp if monitored_temp is None else monitored_temp
             self.status_text.set_text(
                 f'Elapsed: {elapsed_str}  [{pace_label}]\n'
-                f'Avg: {avg_temp:.1f}°C  (target: {target:.0f}°C)\n'
+                f'{monitored_label}: {shown_monitored:.1f}°C  (target: {target:.0f}°C)\n'
                 f'Max: {max_temp:.1f}°C\n'
                 f'Ctr: {center_temp:.1f}°C'
             )
@@ -1032,8 +1264,8 @@ class ReflowMonitor(object):
         if priority:
             self._sound_priority_until = now + self._sound_priority_grace
 
-    def _check_pace(self, max_temp: float) -> Optional[str]:
-        """Compare live max temp against the SAC305 target and play audio feedback.
+    def _check_pace(self, monitored_temp: float) -> Optional[str]:
+        """Compare a selected live metric against SAC305 target and play feedback.
 
         Returns the current pace: "slow", "fast", "good", or None if not started.
         Plays the corresponding sound if the pace changed or the cooldown expired.
@@ -1043,7 +1275,7 @@ class ReflowMonitor(object):
 
         elapsed = time.time() - self.start_time
         target = float(sac305_profile(np.array([elapsed]))[0])
-        deviation = max_temp - target  # positive = ahead, negative = behind
+        deviation = monitored_temp - target  # positive = ahead, negative = behind
 
         if deviation < -self._pace_tolerance:
             pace = "slow"
@@ -1167,6 +1399,49 @@ class ReflowMonitor(object):
                     logger.error(
                         f"Failed to switch to low-temp mode: {e}")
 
+    def _check_temperature_alerts(self, max_temp: float) -> None:
+        """Play one-shot notifications for key thermal thresholds."""
+        if not self.started:
+            return
+
+        if (not self._liquidus_announced) and max_temp >= 217.0:
+            self._play_sound(self._sound_liquidus, priority=True)
+            self._liquidus_announced = True
+            logger.info("Liquidus reached (>= 217°C).")
+
+        if (not self._paste_peak_announced) and max_temp >= 249.0:
+            self._play_sound(self._sound_paste_peak, priority=True)
+            self._paste_peak_announced = True
+            logger.info("Paste max temperature reached (>= 249°C).")
+
+        if (
+            self._pcb_safe_peak_temp is not None
+            and (not self._pcb_peak_announced)
+            and max_temp >= self._pcb_safe_peak_temp
+        ):
+            self._play_sound(self._sound_pcb_peak, priority=True)
+            self._pcb_peak_announced = True
+            logger.info(
+                f"PCB safe peak reached for material "
+                f"'{self._pcb_material}' (>= {self._pcb_safe_peak_temp:.0f}°C)."
+            )
+
+    def _get_monitored_temperature(
+        self,
+        avg_temp: float,
+        min_temp: float,
+        max_temp: float,
+        center_temp: float
+    ) -> Tuple[float, str]:
+        """Return the selected metric value and label used for pace tracking."""
+        metric_map = {
+            "average": (avg_temp, "Avg"),
+            "min": (min_temp, "Min"),
+            "max": (max_temp, "Max"),
+            "center": (center_temp, "Ctr"),
+        }
+        return metric_map.get(self._monitor_temp, (avg_temp, "Avg"))
+
     def run(self) -> None:
         """Main monitoring loop."""
         import matplotlib.pyplot as plt
@@ -1178,6 +1453,8 @@ class ReflowMonitor(object):
 
         # --- ROI selection phase ---
         self._select_roi()
+        # --- Exclusion zone selection phase ---
+        self._select_exclusion_zones()
 
         logger.info("Reflow monitor started. Press Esc in the thermal window "
                     "to quit.")
@@ -1185,13 +1462,30 @@ class ReflowMonitor(object):
             logger.info(f"Using ROI: {self.roi}")
         else:
             logger.info("Using full frame (no ROI).")
+        logger.info(f"Exclusion zones configured: {len(self.exclude_zones)}")
+        if self._pcb_safe_peak_temp is not None:
+            logger.info(
+                f"PCB material '{self._pcb_material}' safe peak: "
+                f"{self._pcb_safe_peak_temp:.0f}°C"
+            )
+        logger.info(f"Pace monitor metric: {self._monitor_temp}")
         logger.info(f"Auto-start threshold: {self.start_threshold}°C "
                     f"(hold for {self.start_hold_seconds}s)")
 
         try:
             while True:
                 avg_temp, max_temp, center_temp = \
-                    self.thermalData.extract_temperatures_fast(roi=self.roi)
+                    self.thermalData.extract_temperatures_fast(
+                        roi=self.roi,
+                        exclude_zones=self.exclude_zones
+                    )
+                min_temp = float(self.thermalData.min_temperature)
+                monitored_temp, monitored_label = self._get_monitored_temperature(
+                    avg_temp=avg_temp,
+                    min_temp=min_temp,
+                    max_temp=max_temp,
+                    center_temp=center_temp
+                )
 
                 # Auto-start detection with debounce
                 if not self.started:
@@ -1220,13 +1514,15 @@ class ReflowMonitor(object):
                         self._threshold_since = None
 
                 # Check pace and play audio feedback
-                pace = self._check_pace(max_temp)
+                pace = self._check_pace(monitored_temp)
 
                 # Check for phase transitions and play announcement sounds
                 self._check_phase_transition()
 
                 # Auto-switch temperature mode (TS001 low/high)
                 self._check_temp_mode(max_temp)
+                # One-shot threshold announcements
+                self._check_temperature_alerts(max_temp)
 
                 # Update heatmap and grab key events BEFORE matplotlib
                 # flush_events() can consume them from the shared macOS
@@ -1235,7 +1531,11 @@ class ReflowMonitor(object):
                 key = cv2.waitKey(1) & 0xFF
 
                 # Update matplotlib plot (may consume events via flush_events)
-                self._update_plot(avg_temp, max_temp, center_temp, pace)
+                self._update_plot(
+                    avg_temp, max_temp, center_temp, pace,
+                    monitored_temp=monitored_temp,
+                    monitored_label=monitored_label
+                )
 
                 # Collect keys pressed on the matplotlib window as well
                 mpl_keys = list(self._pending_keys)
@@ -1308,6 +1608,20 @@ if __name__ == "__main__":
     parser.add_argument("--start-hold", type=float, default=5.0,
                         help="seconds the avg temp must stay above threshold "
                              "before the timer starts (default: 5.0)")
+    parser.add_argument(
+        "--monitor-temp",
+        choices=["average", "min", "max", "center"],
+        default="average",
+        help="temperature metric used for pace tracking "
+             "(default: average)."
+    )
+    parser.add_argument(
+        "--pcb-material",
+        choices=list(PCB_SAFE_PEAK_TEMPS_C.keys()),
+        default="tg135_generic_fr4",
+        help="PCB material key for safe-peak notification threshold "
+             "(minimum safe peak from pcb_temperature.md table)."
+    )
     args = parser.parse_args()
 
     def list_devices():
@@ -1347,6 +1661,9 @@ if __name__ == "__main__":
                 logger.warning(f"Could not connect to TS001 via USB: {e}. "
                                f"Temperature mode switching disabled. "
                                f"Readings will be limited to ~215°C.")
+        if args.pcb_material is None:
+            logger.warning("No --pcb-material provided: PCB safe-peak "
+                           "notification is disabled.")
 
         monitor = ReflowMonitor(
             cameraFeed=camera_feed,
@@ -1354,6 +1671,8 @@ if __name__ == "__main__":
             start_threshold=args.start_threshold,
             start_hold_seconds=args.start_hold,
             ts001_usb=ts001_usb,
+            pcb_material=args.pcb_material,
+            monitor_temp=args.monitor_temp,
         )
         monitor.run()
         sys.exit(0)
